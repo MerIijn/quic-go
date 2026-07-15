@@ -425,6 +425,34 @@ func (t *Transport) removeClient(hostname string) {
 	delete(t.clients, hostname)
 }
 
+// Warm establishes (or reuses) a pooled connection to hostname without sending
+// a request, so a later RoundTrip to the same host reuses it with no QUIC
+// handshake on the request's critical path — like a browser opening the QUIC
+// session in the background after seeing Alt-Svc. It blocks until the
+// connection's handshake completes or fails, and returns any dial error.
+// hostname is a host or host:port (e.g. "example.com:443").
+func (t *Transport) Warm(ctx context.Context, hostname string) error {
+	if err := t.init(); err != nil {
+		return err
+	}
+	hostname = authorityAddr(hostname)
+	cl, _, err := t.getClient(ctx, hostname, false)
+	if err != nil {
+		return err
+	}
+	defer cl.useCount.Add(-1)
+	select {
+	case <-cl.dialing:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+	if cl.dialErr != nil {
+		t.removeClient(hostname)
+		return cl.dialErr
+	}
+	return nil
+}
+
 // NewClientConn creates a new HTTP/3 client connection on top of a QUIC connection.
 // Most users should use RoundTrip instead of creating a connection directly.
 // Specifically, it is not needed to perform GET, POST, HEAD and CONNECT requests.
