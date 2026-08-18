@@ -2,9 +2,9 @@ package http3
 
 import (
 	"context"
-	tls "github.com/refraction-networking/utls"
 	"errors"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
 	"io"
 	"log/slog"
 	"net"

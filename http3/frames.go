@@ -166,12 +166,26 @@ const (
 	settingDatagram = 0x33
 )
 
+// SettingVal is a single HTTP/3 SETTINGS identifier/value pair. A slice of these
+// lets a client emit its SETTINGS frame in an exact, fixed order (as real
+// browsers do) rather than the non-deterministic order a map produces.
+type SettingVal struct {
+	ID  uint64
+	Val uint64
+}
+
 type settingsFrame struct {
 	MaxFieldSectionSize int64 // SETTINGS_MAX_FIELD_SECTION_SIZE, -1 if not set
 
 	Datagram        bool              // HTTP Datagrams, RFC 9297
 	ExtendedConnect bool              // Extended CONNECT, RFC 9220
 	Other           map[uint64]uint64 // all settings that we don't explicitly recognize
+
+	// Ordered, when non-nil, is emitted verbatim by Append in slice order and
+	// takes precedence over every other field. It lets a client reproduce a
+	// browser's exact SETTINGS identifiers, values, and on-wire order (including
+	// a GREASE setting). The other fields remain the fallback when Ordered is nil.
+	Ordered []SettingVal
 }
 
 func pointer[T any](v T) *T {
@@ -261,6 +275,21 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 }
 
 func (f *settingsFrame) Append(b []byte) []byte {
+	// Ordered emission: reproduce a browser's exact SETTINGS bytes and order.
+	if f.Ordered != nil {
+		b = quicvarint.Append(b, 0x4)
+		var l int
+		for _, s := range f.Ordered {
+			l += quicvarint.Len(s.ID) + quicvarint.Len(s.Val)
+		}
+		b = quicvarint.Append(b, uint64(l))
+		for _, s := range f.Ordered {
+			b = quicvarint.Append(b, s.ID)
+			b = quicvarint.Append(b, s.Val)
+		}
+		return b
+	}
+
 	b = quicvarint.Append(b, 0x4)
 	var l int
 	if f.MaxFieldSectionSize >= 0 {

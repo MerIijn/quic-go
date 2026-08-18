@@ -562,6 +562,12 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		}
 		return hdr, pl
 	} else {
+		// NOTE: do NOT fragment the client Initial's CRYPTO data here. quic-go
+		// already splits and reorders the ClientHello (initialCryptoStream's
+		// scramble/cuts logic), and forcing additional small frames on top of it
+		// produced malformed crypto streams that aborted the handshake with a local
+		// CRYPTO_ERROR ("tls: internal error") on a fraction of connections —
+		// visible in qlog as an immediate connection_close after the first flight.
 		for hasCryptoData() {
 			cf := popCryptoFrame(maxPacketSize)
 			if cf == nil {
@@ -875,7 +881,7 @@ func (p *packetPacker) appendLongHeaderPacket(buffer *packetBuffer, header *wire
 	}
 	payloadOffset := protocol.ByteCount(len(raw))
 
-	raw, err = p.appendPacketPayload(raw, pl, paddingLen, v)
+	raw, err = p.appendPacketPayload(raw, pl, paddingLen, encLevel == protocol.EncryptionInitial && p.perspective == protocol.PerspectiveClient, v)
 	if err != nil {
 		return nil, err
 	}
@@ -920,7 +926,7 @@ func (p *packetPacker) appendShortHeaderPacket(
 	}
 	payloadOffset := protocol.ByteCount(len(raw))
 
-	raw, err = p.appendPacketPayload(raw, pl, paddingLen, v)
+	raw, err = p.appendPacketPayload(raw, pl, paddingLen, false, v)
 	if err != nil {
 		return shortHeaderPacket{}, err
 	}
@@ -950,7 +956,7 @@ func (p *packetPacker) appendShortHeaderPacket(
 
 // appendPacketPayload serializes the payload of a packet into the raw byte slice.
 // It modifies the order of payload.frames.
-func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen protocol.ByteCount, v protocol.Version) ([]byte, error) {
+func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen protocol.ByteCount, chromeInitialPadding bool, v protocol.Version) ([]byte, error) {
 	payloadOffset := len(raw)
 	if pl.ack != nil {
 		var err error
@@ -960,7 +966,18 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 		}
 	}
 	if paddingLen > 0 {
-		raw = append(raw, make([]byte, paddingLen)...)
+		if chromeInitialPadding {
+			// Chrome/QUICHE scatters PING (0x01) frames through the client Initial's
+			// padding rather than emitting a solid run of PADDING (0x00). Initial
+			// packets are decryptable by any observer, so this layout is visible.
+			pad := make([]byte, paddingLen)
+			for i := 0; i < int(paddingLen/64)+6; i++ {
+				pad[p.rand.IntN(int(paddingLen))] = 0x01
+			}
+			raw = append(raw, pad...)
+		} else {
+			raw = append(raw, make([]byte, paddingLen)...)
+		}
 	}
 	// Randomize the order of the control frames.
 	// This makes sure that the receiver doesn't rely on the order in which frames are packed.

@@ -2,6 +2,8 @@ package http3
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -9,13 +11,14 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/textproto"
+	"os"
 	"sync"
 	"time"
 
-	"github.com/quic-go/qpack"
 	"github.com/MerIijn/quic-go"
 	"github.com/MerIijn/quic-go/http3/qlog"
 	"github.com/MerIijn/quic-go/qlogwriter"
+	"github.com/MerIijn/quic-go/qpack"
 )
 
 const (
@@ -75,6 +78,15 @@ type ClientConn struct {
 	qlogger qlogwriter.Recorder
 	logger  *slog.Logger
 
+	// settings, when non-nil, is the exact ordered SETTINGS frame to emit
+	// (browser fingerprint). It takes precedence over additionalSettings/
+	// maxResponseHeaderBytes for the emitted frame.
+	settings []SettingVal
+	// pseudoHeaderOrder / headerOrder are the default request header ordering
+	// (browser fingerprint); a per-request PHeader-Order / Header-Order overrides.
+	pseudoHeaderOrder []string
+	headerOrder       []string
+
 	requestWriter *requestWriter
 }
 
@@ -87,6 +99,9 @@ func newClientConn(
 	maxResponseHeaderBytes int,
 	disableCompression bool,
 	logger *slog.Logger,
+	settings []SettingVal,
+	pseudoHeaderOrder []string,
+	headerOrder []string,
 ) *ClientConn {
 	var qlogger qlogwriter.Recorder
 	if qlogTrace := conn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
@@ -101,6 +116,9 @@ func newClientConn(
 		logger:             logger,
 		qlogger:            qlogger,
 		decoder:            qpack.NewDecoder(),
+		settings:           settings,
+		pseudoHeaderOrder:  pseudoHeaderOrder,
+		headerOrder:        headerOrder,
 	}
 	if maxResponseHeaderBytes <= 0 {
 		c.maxResponseHeaderBytes = defaultMaxResponseHeaderBytes
@@ -108,6 +126,10 @@ func newClientConn(
 		c.maxResponseHeaderBytes = maxResponseHeaderBytes
 	}
 	c.requestWriter = newRequestWriter()
+	if pseudoHeaderOrder != nil {
+		c.requestWriter.pseudoHeaderOrder = pseudoHeaderOrder
+	}
+	c.requestWriter.headerOrder = headerOrder
 	c.rawConn = newRawConn(
 		conn,
 		enableDatagrams,
@@ -116,22 +138,117 @@ func newClientConn(
 		qlogger,
 		c.logger,
 	)
+	// If we advertise a non-zero QPACK_MAX_TABLE_CAPACITY, enable dynamic-table
+	// decoding: build a table and feed the peer's encoder stream into it so
+	// dynamic-table-encoded responses decode (real browsers advertise 65536).
+	if capBytes := qpackMaxTableCapacity(settings); capBytes > 0 {
+		dt := qpack.NewDynamicTable(capBytes)
+		c.decoder.SetDynamicTable(dt)
+		c.rawConn.qpackEncoderStrHandler = func(str *quic.ReceiveStream) {
+			_ = dt.ParseEncoderInstructions(str)
+		}
+	}
 	// send the SETTINGs frame, using 0-RTT data, if possible
 	go func() {
-		_, err := c.rawConn.openControlStream(&settingsFrame{
+		sf := &settingsFrame{
 			Datagram:            enableDatagrams,
 			Other:               additionalSettings,
 			MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
-		})
-		if err != nil {
+		}
+		// A browser-fingerprint client supplies its exact ordered SETTINGS. Browsers
+		// also append a GREASE setting whose reserved id (0x1f*N+0x21) AND value are
+		// randomized per connection — emitting a constant pair would itself be a
+		// fingerprint — so generate it here rather than taking it from the caller's
+		// static list. Reserved ids are >= 0x40, so appending keeps ascending-id
+		// order (QUICHE serializes its settings map by id).
+		if c.settings != nil {
+			ordered := make([]SettingVal, 0, len(c.settings)+1)
+			ordered = append(ordered, c.settings...)
+			ordered = append(ordered, greaseSetting())
+			sf = &settingsFrame{Ordered: ordered}
+		}
+		if _, err := c.rawConn.openControlStream(sf); err != nil {
 			if c.logger != nil {
 				c.logger.Debug("setting up connection failed", "error", err)
 			}
 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeInternalError), "")
 			return
 		}
+		// Open the QPACK encoder/decoder streams right after the control stream
+		// (browsers do; matching the uni-stream topology avoids a fingerprint
+		// tell). Non-fatal on error — the control stream is what the peer needs.
+		if err := c.rawConn.openQPACKStreams(); err != nil {
+			if c.logger != nil {
+				c.logger.Debug("opening QPACK streams failed", "error", err)
+			}
+			return
+		}
+		// Request-side QPACK dynamic-table encoding (insert on the encoder stream
+		// and reference by index) is implemented but DISABLED: when enabled, the
+		// origin stops responding (stream stays open, connection idles out), so the
+		// instruction/prefix encoding is not yet correct. Set VIBETLS_QPACK_DYNAMIC=1
+		// to experiment. Static+literal encoding is always valid on the wire.
+		if c.settings != nil && os.Getenv("VIBETLS_QPACK_DYNAMIC") == "1" {
+			select {
+			case <-c.rawConn.ReceivedSettings():
+			case <-c.conn.Context().Done():
+				return
+			}
+			if peerCap := peerQPACKCapacity(c.rawConn.Settings()); peerCap > 0 {
+				if ours := qpackMaxTableCapacity(c.settings); ours > 0 && ours < peerCap {
+					peerCap = ours
+				}
+				c.requestWriter.enableDynamicQPACK(c.rawConn.qpackEncStr, peerCap)
+			}
+		}
 	}()
 	return c
+}
+
+// requestPriority returns the request's priority header value (checking the
+// lowercase and canonical keys), used to mirror Chrome's PRIORITY_UPDATE frame.
+func requestPriority(req *http.Request) string {
+	for _, k := range []string{"priority", "Priority"} {
+		if v := req.Header[k]; len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+// greaseSetting returns a fresh HTTP/3 GREASE setting: a reserved identifier of
+// the form 0x1f*N+0x21 with a random value, matching what browsers emit (both the
+// id and the value differ on every connection).
+func greaseSetting() SettingVal {
+	var b [8]byte
+	crand.Read(b[:])
+	n := binary.BigEndian.Uint64(b[:]) % (1 << 26) // keep the varint a sane length
+	if n == 0 {
+		n = 1
+	}
+	var v [4]byte
+	crand.Read(v[:])
+	return SettingVal{ID: 0x1f*n + 0x21, Val: uint64(binary.BigEndian.Uint32(v[:]))}
+}
+
+// peerQPACKCapacity returns the peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x1),
+// which bounds how large a dynamic table we may build as the encoder.
+func peerQPACKCapacity(s *Settings) uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.Other[0x1]
+}
+
+// qpackMaxTableCapacity returns the advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY
+// (id 0x1) from the ordered settings, or 0 if absent.
+func qpackMaxTableCapacity(settings []SettingVal) uint64 {
+	for _, s := range settings {
+		if s.ID == 0x1 {
+			return s.Val
+		}
+	}
+	return 0
 }
 
 // OpenRequestStream opens a new request stream on the HTTP/3 connection.
@@ -318,6 +435,13 @@ func (c *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	)
 	if err != nil {
 		return nil, &errConnUnusable{e: err}
+	}
+
+	// Chrome sends a PRIORITY_UPDATE frame on the control stream for each request,
+	// carrying the request's priority (e.g. "u=0, i" for the main navigation).
+	// Mirror it so the control-stream frame pattern matches a browser.
+	if prio := requestPriority(req); prio != "" {
+		c.rawConn.sendPriorityUpdate(str.StreamID(), prio)
 	}
 
 	// Request Cancellation:

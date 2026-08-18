@@ -16,10 +16,10 @@ import (
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/idna"
 
-	"github.com/quic-go/qpack"
 	"github.com/MerIijn/quic-go"
 	"github.com/MerIijn/quic-go/http3/qlog"
 	"github.com/MerIijn/quic-go/qlogwriter"
+	"github.com/MerIijn/quic-go/qpack"
 )
 
 const bodyCopyBufferSize = 8 * 1024
@@ -28,15 +28,45 @@ type requestWriter struct {
 	mutex     sync.Mutex
 	encoder   *qpack.Encoder
 	headerBuf *bytes.Buffer
+
+	// pseudoHeaderOrder / headerOrder are the default request header ordering
+	// (browser fingerprint). A per-request PHeader-Order / Header-Order header
+	// overrides them. See enumerateHeaders in encodeHeaders.
+	pseudoHeaderOrder []string
+	headerOrder       []string
 }
+
+// defaultPseudoHeaderOrder is Chrome's request pseudo-header order, used when the
+// Transport sets none. RFC 9114 permits any order; matching Chrome avoids a tell.
+var defaultPseudoHeaderOrder = []string{":method", ":authority", ":scheme", ":path"}
+
+// Control headers consumed for ordering and never emitted on the wire (they
+// mirror the sibling net/http2 fork's Header-Order / PHeader-Order mechanism).
+const (
+	headerOrderKey       = "Header-Order"
+	pseudoHeaderOrderKey = "PHeader-Order"
+)
 
 func newRequestWriter() *requestWriter {
 	headerBuf := &bytes.Buffer{}
 	encoder := qpack.NewEncoder(headerBuf)
 	return &requestWriter{
-		encoder:   encoder,
-		headerBuf: headerBuf,
+		encoder:           encoder,
+		headerBuf:         headerBuf,
+		pseudoHeaderOrder: defaultPseudoHeaderOrder,
 	}
+}
+
+// enableDynamicQPACK switches the shared encoder to dynamic-table mode, writing
+// insertions to the QPACK encoder stream. Guarded by the same mutex writeHeaders
+// takes, so it can't race with an in-flight request.
+func (w *requestWriter) enableDynamicQPACK(encStream io.Writer, capacity uint64) {
+	if encStream == nil || capacity == 0 {
+		return
+	}
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	w.encoder.EnableDynamicTable(encStream, capacity)
 }
 
 func (w *requestWriter) WriteRequestHeader(wr io.Writer, req *http.Request, gzip bool, streamID quic.StreamID, qlogger qlogwriter.Recorder) error {
@@ -71,6 +101,13 @@ func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool,
 
 	headerFields, err := w.encodeHeaders(req, gzip, trailers, actualContentLength(req), qlogger != nil)
 	if err != nil {
+		return err
+	}
+	// Completes the block. In QPACK dynamic-table mode the fields were buffered
+	// (the prefix carries the Required Insert Count, so it can only be written
+	// once every field is known); this emits the encoder-stream insertions and
+	// the encoded block. It is a no-op for the static-only encoder.
+	if err := w.encoder.Flush(); err != nil {
 		return err
 	}
 
@@ -145,62 +182,154 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 		}
 	}
 
+	// Effective ordering: a per-request PHeader-Order / Header-Order header
+	// overrides the writer's (browser-profile) defaults. These control headers
+	// are consumed here and never emitted on the wire (see emitField).
+	pseudoOrder := w.pseudoHeaderOrder
+	if v := req.Header[pseudoHeaderOrderKey]; len(v) > 0 {
+		pseudoOrder = v
+	}
+	headerOrder := w.headerOrder
+	if v := req.Header[headerOrderKey]; len(v) > 0 {
+		headerOrder = v
+	}
+
 	enumerateHeaders := func(f func(name, value string)) {
 		// 8.1.2.3 Request Pseudo-Header Fields
 		// The :path pseudo-header field includes the path and query parts of the
 		// target URI (the path-absolute production and optionally a '?' character
 		// followed by the query production (see Sections 3.3 and 3.4 of
 		// [RFC3986]).
-		f(":authority", host)
-		f(":method", req.Method)
+		type pseudoKV struct{ k, v string }
+		pseudos := []pseudoKV{{":authority", host}, {":method", req.Method}}
 		if req.Method != http.MethodConnect || isExtendedConnect {
-			f(":path", path)
-			f(":scheme", req.URL.Scheme)
+			pseudos = append(pseudos, pseudoKV{":path", path}, pseudoKV{":scheme", req.URL.Scheme})
 		}
 		if isExtendedConnect {
-			f(":protocol", req.Proto)
+			pseudos = append(pseudos, pseudoKV{":protocol", req.Proto})
+		}
+		if len(pseudoOrder) > 0 {
+			done := make(map[string]bool, len(pseudos))
+			for _, name := range pseudoOrder {
+				for _, p := range pseudos {
+					if p.k == name && !done[p.k] {
+						f(p.k, p.v)
+						done[p.k] = true
+					}
+				}
+			}
+			for _, p := range pseudos { // any not covered by the order
+				if !done[p.k] {
+					f(p.k, p.v)
+				}
+			}
+		} else {
+			for _, p := range pseudos {
+				f(p.k, p.v)
+			}
 		}
 		if trailers != "" {
 			f("trailer", trailers)
 		}
 
 		var didUA bool
-		for k, vv := range req.Header {
+		// emitField applies the per-header rules (skip Host/Content-Length and the
+		// connection-specific + ordering-control headers, dedup User-Agent, split
+		// Cookie per RFC 9113 §8.1.2.5) to a single header key.
+		emitField := func(k string, vv []string) {
 			if strings.EqualFold(k, "host") || strings.EqualFold(k, "content-length") {
 				// Host is :authority, already sent.
 				// Content-Length is automatic, set below.
-				continue
+				return
+			} else if strings.EqualFold(k, headerOrderKey) || strings.EqualFold(k, pseudoHeaderOrderKey) {
+				// Ordering-control headers: consumed above, never on the wire.
+				return
 			} else if strings.EqualFold(k, "connection") || strings.EqualFold(k, "proxy-connection") ||
 				strings.EqualFold(k, "transfer-encoding") || strings.EqualFold(k, "upgrade") ||
 				strings.EqualFold(k, "keep-alive") {
-				// Per 8.1.2.2 Connection-Specific Header
-				// Fields, don't send connection-specific
-				// fields. We have already checked if any
-				// are error-worthy so just ignore the rest.
-				continue
+				// Per 8.1.2.2 Connection-Specific Header Fields, don't send
+				// connection-specific fields.
+				return
 			} else if strings.EqualFold(k, "user-agent") {
-				// Match Go's http1 behavior: at most one
-				// User-Agent. If set to nil or empty string,
-				// then omit it. Otherwise if not mentioned,
-				// include the default (below).
+				// Match Go's http1 behavior: at most one User-Agent. If set to nil
+				// or empty string, omit it; otherwise if not mentioned include the
+				// default (below).
 				didUA = true
 				if len(vv) < 1 {
-					continue
+					return
 				}
 				vv = vv[:1]
 				if vv[0] == "" {
-					continue
+					return
 				}
-
+			} else if strings.EqualFold(k, "cookie") {
+				// Per 8.1.2.5, the Cookie header MAY be split into separate fields
+				// for better compression. Browsers split on "; ".
+				for _, v := range vv {
+					for {
+						p := strings.IndexByte(v, ';')
+						if p < 0 {
+							break
+						}
+						f("cookie", v[:p])
+						p++
+						for p+1 <= len(v) && v[p] == ' ' {
+							p++
+						}
+						v = v[p:]
+					}
+					if len(v) > 0 {
+						f("cookie", v)
+					}
+				}
+				return
 			}
 
 			for _, v := range vv {
 				f(k, v)
 			}
 		}
-		if shouldSendReqContentLength(req.Method, contentLength) {
-			f("content-length", strconv.FormatInt(contentLength, 10))
+
+		// content-length is computed automatically, so it never appears in
+		// req.Header and the ordering loop can't place it. Honor the slot the
+		// caller gave "content-length" in Header-Order; otherwise trail (stdlib
+		// default).
+		sendCL := shouldSendReqContentLength(req.Method, contentLength)
+		clEmitted := false
+		emitContentLength := func() {
+			if sendCL && !clEmitted {
+				f("content-length", strconv.FormatInt(contentLength, 10))
+				clEmitted = true
+			}
 		}
+
+		if len(headerOrder) > 0 {
+			// Emit regular headers in the caller's order (case-insensitive), then
+			// any remaining headers in map order.
+			done := make(map[string]bool, len(req.Header))
+			for _, name := range headerOrder {
+				if strings.EqualFold(name, "content-length") {
+					emitContentLength()
+					continue
+				}
+				for k, vv := range req.Header {
+					if !done[k] && strings.EqualFold(k, name) {
+						emitField(k, vv)
+						done[k] = true
+					}
+				}
+			}
+			for k, vv := range req.Header {
+				if !done[k] {
+					emitField(k, vv)
+				}
+			}
+		} else {
+			for k, vv := range req.Header {
+				emitField(k, vv)
+			}
+		}
+		emitContentLength() // trailing fallback when not placed via Header-Order
 		if addGzipHeader {
 			f("accept-encoding", "gzip")
 		}

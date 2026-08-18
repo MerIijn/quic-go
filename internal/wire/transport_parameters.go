@@ -483,8 +483,17 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 // Order matches a real Chrome capture (Chrome shuffles per-connection, so any of its
 // orderings is fine); values are pinned to Chrome's.
 func (p *TransportParameters) marshalChrome() []byte {
-	b := make([]byte, 0, 200)
-
+	// Chrome emits its transport parameters in a DIFFERENT order on every
+	// connection (verified: two ClientHellos from the same browser run carry
+	// completely different orders). Emitting a fixed sequence — as this used to —
+	// is a cross-connection fingerprint even when the parameter set is identical.
+	// So build each parameter separately and shuffle before concatenating.
+	var params [][]byte
+	add := func(chunk []byte) {
+		if len(chunk) > 0 {
+			params = append(params, chunk)
+		}
+	}
 	// version_information (0x11): chosen(1), available[ chosen(1), GREASE ]
 	greaseVer := make([]byte, 4)
 	rand.Read(greaseVer)
@@ -493,44 +502,64 @@ func (p *TransportParameters) marshalChrome() []byte {
 	greaseVer[2] = greaseVer[0]
 	greaseVer[3] = greaseVer[0] // GREASE version 0x?a?a?a?a style
 	verInfo := append([]byte{0, 0, 0, 1, 0, 0, 0, 1}, greaseVer...)
-	b = quicvarint.Append(b, 0x11)
-	b = quicvarint.Append(b, uint64(len(verInfo)))
-	b = append(b, verInfo...)
+	chunk := quicvarint.Append(nil, 0x11)
+	chunk = quicvarint.Append(chunk, uint64(len(verInfo)))
+	add(append(chunk, verInfo...))
 
-	b = p.marshalVarintParam(b, initialMaxDataParameterID, uint64(p.InitialMaxData))
+	add(p.marshalVarintParam(nil, initialMaxDataParameterID, uint64(p.InitialMaxData)))
 
 	// initial_source_connection_id (Chrome sends a 0-length CID here)
-	b = quicvarint.Append(b, uint64(initialSourceConnectionIDParameterID))
-	b = quicvarint.Append(b, uint64(p.InitialSourceConnectionID.Len()))
-	b = append(b, p.InitialSourceConnectionID.Bytes()...)
+	chunk = quicvarint.Append(nil, uint64(initialSourceConnectionIDParameterID))
+	chunk = quicvarint.Append(chunk, uint64(p.InitialSourceConnectionID.Len()))
+	add(append(chunk, p.InitialSourceConnectionID.Bytes()...))
 
-	b = p.marshalVarintParam(b, initialMaxStreamDataUniParameterID, uint64(p.InitialMaxStreamDataUni))
-	b = p.marshalVarintParam(b, maxIdleTimeoutParameterID, uint64(p.MaxIdleTimeout/time.Millisecond))
-	b = p.marshalVarintParam(b, maxDatagramFrameSizeParameterID, 65536) // Chrome sends max_datagram_frame_size=65536
+	add(p.marshalVarintParam(nil, initialMaxStreamDataUniParameterID, uint64(p.InitialMaxStreamDataUni)))
+	add(p.marshalVarintParam(nil, maxIdleTimeoutParameterID, 30000))       // Chrome 151 sends max_idle_timeout=30000ms
+	add(p.marshalVarintParam(nil, maxDatagramFrameSizeParameterID, 65536)) // Chrome sends max_datagram_frame_size=65536
 
-	// a GREASE reserved parameter (id of form 31*N+27), 14 random bytes of value
-	gid := make([]byte, 6)
+	// A GREASE reserved parameter (id of form 31*N+27). Chrome randomizes BOTH the
+	// id and the value LENGTH — observed 1, 9, 12 and 14 bytes across captures — so
+	// pick the length per connection too. Hardcoding one length made our
+	// quic_transport_parameters extension a fixed size while Chrome's varies.
+	gid := make([]byte, 7)
 	rand.Read(gid)
 	greaseID := 27 + 31*(uint64(gid[0])<<32|uint64(gid[1])<<24|uint64(gid[2])<<16|uint64(gid[3])<<8|uint64(gid[4]))
-	gval := make([]byte, 14)
+	gval := make([]byte, 1+int(gid[5])%16)
 	rand.Read(gval)
-	b = quicvarint.Append(b, greaseID)
-	b = quicvarint.Append(b, uint64(len(gval)))
-	b = append(b, gval...)
+	chunk = quicvarint.Append(nil, greaseID)
+	chunk = quicvarint.Append(chunk, uint64(len(gval)))
+	add(append(chunk, gval...))
 
-	b = p.marshalVarintParam(b, maxUDPPayloadSizeParameterID, uint64(p.MaxUDPPayloadSize))
-	b = p.marshalVarintParam(b, initialMaxStreamDataBidiLocalParameterID, uint64(p.InitialMaxStreamDataBidiLocal))
-	b = p.marshalVarintParam(b, initialMaxStreamsUniParameterID, uint64(p.MaxUniStreamNum))
+	add(p.marshalVarintParam(nil, maxUDPPayloadSizeParameterID, uint64(p.MaxUDPPayloadSize)))
+	add(p.marshalVarintParam(nil, initialMaxStreamDataBidiLocalParameterID, uint64(p.InitialMaxStreamDataBidiLocal)))
+	add(p.marshalVarintParam(nil, initialMaxStreamsUniParameterID, uint64(p.MaxUniStreamNum)))
 
-	// google_connection_options (0x3128)
-	gco := []byte{0x4f, 0x52, 0x49, 0x47, 0x4e, 0x4f, 0x49, 0x50}
-	b = quicvarint.Append(b, 0x3128)
-	b = quicvarint.Append(b, uint64(len(gco)))
-	b = append(b, gco...)
+	// NOTE: google_initial_rtt (0x3127) is deliberately NOT sent. Chrome only
+	// includes it when it already has a cached RTT estimate for the origin; on a
+	// fresh connection — which is always our case — it is absent. Emitting it
+	// unconditionally added 5 bytes Chrome doesn't send.
 
-	b = p.marshalVarintParam(b, initialMaxStreamDataBidiRemoteParameterID, uint64(p.InitialMaxStreamDataBidiRemote))
-	b = p.marshalVarintParam(b, initialMaxStreamsBidiParameterID, uint64(p.MaxBidiStreamNum))
+	// google_connection_options (0x3128): Chrome 151 sends "ORIG" (4 bytes), not
+	// the older 8-byte "ORIGNOIP".
+	gco := []byte{0x4f, 0x52, 0x49, 0x47} // "ORIG"
+	chunk = quicvarint.Append(nil, 0x3128)
+	chunk = quicvarint.Append(chunk, uint64(len(gco)))
+	add(append(chunk, gco...))
 
+	add(p.marshalVarintParam(nil, initialMaxStreamDataBidiRemoteParameterID, uint64(p.InitialMaxStreamDataBidiRemote)))
+	add(p.marshalVarintParam(nil, initialMaxStreamsBidiParameterID, uint64(p.MaxBidiStreamNum)))
+
+	// Shuffle, like Chrome does on every connection.
+	b := make([]byte, 0, 200)
+	for i := len(params) - 1; i > 0; i-- {
+		var r [8]byte
+		rand.Read(r[:])
+		j := int(binary.BigEndian.Uint64(r[:]) % uint64(i+1))
+		params[i], params[j] = params[j], params[i]
+	}
+	for _, chunk := range params {
+		b = append(b, chunk...)
+	}
 	return b
 }
 

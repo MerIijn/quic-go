@@ -58,14 +58,11 @@ func ParseConnectionID(b []byte) ConnectionID {
 }
 
 // GenerateConnectionIDForInitial generates a connection ID for the Initial packet.
-// It uses a length randomly chosen between 8 and 20 bytes.
+// Chrome/QUICHE always uses an 8-byte destination connection ID on the initial
+// packet; the stock quic-go randomizes 8–20, which is a fingerprint tell. Pin it
+// to 8 to match Chrome.
 func GenerateConnectionIDForInitial() (ConnectionID, error) {
-	r := make([]byte, 1)
-	if _, err := rand.Read(r); err != nil {
-		return ConnectionID{}, err
-	}
-	l := MinConnectionIDLenInitial + int(r[0])%(maxConnectionIDLen-MinConnectionIDLenInitial+1)
-	return GenerateConnectionID(l)
+	return GenerateConnectionID(8)
 }
 
 // ReadConnectionID reads a connection ID of length len from the given io.Reader.

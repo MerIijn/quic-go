@@ -4,7 +4,6 @@ go 1.25.0
 
 require (
 	github.com/quic-go/go-ossfuzz-seeds v0.1.0
-	github.com/quic-go/qpack v0.6.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/mock v0.5.2
 	golang.org/x/crypto v0.51.0

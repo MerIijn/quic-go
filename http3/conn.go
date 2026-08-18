@@ -35,10 +35,24 @@ type rawConn struct {
 	streamMx sync.Mutex
 	streams  map[quic.StreamID]*stateTrackingStream
 
-	rcvdControlStr      atomic.Bool
-	rcvdQPACKEncoderStr atomic.Bool
-	rcvdQPACKDecoderStr atomic.Bool
-	controlStrHandler   func(*quic.ReceiveStream, *frameParser) // is called *after* the SETTINGS frame was parsed
+	rcvdControlStr         atomic.Bool
+	rcvdQPACKEncoderStr    atomic.Bool
+	rcvdQPACKDecoderStr    atomic.Bool
+	controlStrHandler      func(*quic.ReceiveStream, *frameParser) // is called *after* the SETTINGS frame was parsed
+	qpackEncoderStrHandler func(*quic.ReceiveStream)               // reads the peer's QPACK encoder stream (dynamic table)
+
+	// QPACK encoder/decoder unidirectional streams. Real browsers open both right
+	// after the control stream even when they never use the QPACK dynamic table.
+	// They carry only their 1-byte stream type and are kept open for the life of
+	// the connection — closing a QPACK stream is an H3_CLOSED_CRITICAL_STREAM
+	// connection error (RFC 9204 §4.2), so these references just pin them alive.
+	qpackEncStr *quic.SendStream
+	qpackDecStr *quic.SendStream
+
+	// controlStr is our local control stream; browsers send PRIORITY_UPDATE frames
+	// on it per request. controlMx guards writes after the initial SETTINGS frame.
+	controlStr *quic.SendStream
+	controlMx  sync.Mutex
 
 	onStreamsEmpty func()
 
@@ -110,7 +124,56 @@ func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, 
 	if _, err := str.Write(b); err != nil {
 		return nil, err
 	}
+	c.controlStr = str
 	return str, nil
+}
+
+// sendPriorityUpdate writes an HTTP/3 PRIORITY_UPDATE frame (type 0xF0700, for a
+// request stream) on the control stream — matching Chrome, which sends one per
+// request with the request's priority (e.g. "u=0, i" for the main navigation).
+// Best-effort: a failure here must not fail the request.
+func (c *rawConn) sendPriorityUpdate(streamID quic.StreamID, priority string) {
+	c.controlMx.Lock()
+	defer c.controlMx.Unlock()
+	if c.controlStr == nil {
+		return
+	}
+	payload := quicvarint.Append(nil, uint64(streamID))
+	payload = append(payload, []byte(priority)...)
+	b := quicvarint.Append(nil, 0xf0700)
+	b = quicvarint.Append(b, uint64(len(payload)))
+	b = append(b, payload...)
+	c.controlStr.Write(b)
+}
+
+// openQPACKStreams opens the client's QPACK decoder (type 0x03) and encoder
+// (type 0x02) unidirectional streams, writing only each stream-type varint. A
+// browser opens both immediately after the control stream even with an empty
+// dynamic table; matching that stream topology avoids an HTTP/3 fingerprint tell.
+//
+// Order matters: verified against a Chrome 150 NetLog, Chrome creates the control
+// stream first (uni id 2), then the QPACK *decoder* (id 6), then the *encoder*
+// (id 10). Uni-stream ids are assigned in open order, so open decoder before
+// encoder to land the same type-on-id mapping. The streams are never closed (see
+// the qpackEncStr/qpackDecStr comment).
+func (c *rawConn) openQPACKStreams() error {
+	dec, err := c.conn.OpenUniStream()
+	if err != nil {
+		return err
+	}
+	if _, err := dec.Write(quicvarint.Append(nil, streamTypeQPACKDecoderStream)); err != nil {
+		return err
+	}
+	enc, err := c.conn.OpenUniStream()
+	if err != nil {
+		return err
+	}
+	if _, err := enc.Write(quicvarint.Append(nil, streamTypeQPACKEncoderStream)); err != nil {
+		return err
+	}
+	c.qpackDecStr = dec
+	c.qpackEncStr = enc
+	return nil
 }
 
 func (c *rawConn) TrackStream(str *quic.Stream) *stateTrackingStream {
@@ -173,7 +236,12 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 		if isFirst := c.rcvdQPACKEncoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK encoder stream")
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		// Feed the peer's QPACK encoder instructions into our dynamic table so
+		// dynamic-table-encoded responses decode. When no handler is set we fall
+		// back to draining/ignoring the stream (static-only).
+		if c.qpackEncoderStrHandler != nil {
+			c.qpackEncoderStrHandler(str)
+		}
 		return
 	case streamTypeQPACKDecoderStream:
 		if isFirst := c.rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {

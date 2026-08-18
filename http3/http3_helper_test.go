@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/qpack"
 	"github.com/MerIijn/quic-go"
 	"github.com/MerIijn/quic-go/http3/qlog"
 	"github.com/MerIijn/quic-go/qlogwriter"
+	"github.com/MerIijn/quic-go/qpack"
 	"github.com/MerIijn/quic-go/quicvarint"
 
 	"github.com/stretchr/testify/require"

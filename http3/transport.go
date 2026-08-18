@@ -2,9 +2,9 @@ package http3
 
 import (
 	"context"
-	tls "github.com/refraction-networking/utls"
 	"errors"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
 	"io"
 	"log/slog"
 	"net"
@@ -98,6 +98,18 @@ type Transport struct {
 	// However, if the user explicitly requested gzip it is not automatically uncompressed.
 	DisableCompression bool
 
+	// Settings, when non-nil, is the exact ordered SETTINGS frame the client
+	// emits (a browser fingerprint), taking precedence over AdditionalSettings
+	// and MaxResponseHeaderBytes for the frame that goes on the wire.
+	Settings []SettingVal
+
+	// PseudoHeaderOrder / HeaderOrder are the default request header ordering
+	// (browser fingerprint). A per-request PHeader-Order / Header-Order header in
+	// the request overrides these. PseudoHeaderOrder defaults, when nil, to
+	// Chrome's :method,:authority,:scheme,:path.
+	PseudoHeaderOrder []string
+	HeaderOrder       []string
+
 	Logger *slog.Logger
 
 	mutex sync.Mutex
@@ -134,6 +146,9 @@ func (t *Transport) init() error {
 				t.MaxResponseHeaderBytes,
 				t.DisableCompression,
 				t.Logger,
+				t.Settings,
+				t.PseudoHeaderOrder,
+				t.HeaderOrder,
 			)
 		}
 	}
@@ -467,6 +482,9 @@ func (t *Transport) NewClientConn(conn *quic.Conn) *ClientConn {
 		t.MaxResponseHeaderBytes,
 		t.DisableCompression,
 		t.Logger,
+		t.Settings,
+		t.PseudoHeaderOrder,
+		t.HeaderOrder,
 	)
 	go func() {
 		for {
@@ -493,6 +511,9 @@ func (t *Transport) NewRawClientConn(conn *quic.Conn) *RawClientConn {
 			t.MaxResponseHeaderBytes,
 			t.DisableCompression,
 			t.Logger,
+			t.Settings,
+			t.PseudoHeaderOrder,
+			t.HeaderOrder,
 		),
 	}
 }

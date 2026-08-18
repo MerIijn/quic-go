@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/MerIijn/quic-go/qpack"
 	ossfuzzseeds "github.com/quic-go/go-ossfuzz-seeds"
-	"github.com/quic-go/qpack"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http/httpguts"
