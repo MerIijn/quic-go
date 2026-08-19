@@ -673,6 +673,7 @@ type qpackAcks struct {
 
 	mu    sync.Mutex
 	acked uint64 // insert count the peer has been told we have
+	prev  uint64 // insert count at the previous flush
 }
 
 func (a *qpackAcks) section(id quic.StreamID, ric uint64) {
@@ -684,11 +685,22 @@ func (a *qpackAcks) section(id quic.StreamID, ric uint64) {
 	a.conn.qpackSectionAck(id)
 }
 
+// flushInserts acknowledges inserts that no Section Acknowledgment covered.
+// Only inserts that stayed unacknowledged across two passes over the encoder
+// stream are counted: a response that references an entry acknowledges it
+// implicitly, which is why Chrome's decoder stream carries no Insert Count
+// Increments at all during an ordinary page load (verified on a decrypted
+// capture: nothing but Section Acknowledgments). Emitting one per batch of
+// inserts, as this used to, is chattier than a browser.
 func (a *qpackAcks) flushInserts() {
 	a.mu.Lock()
 	n := a.dt.InsertCount()
-	inc := n - a.acked
-	a.acked = n
+	var inc uint64
+	if a.prev > a.acked && n >= a.prev {
+		inc = a.prev - a.acked
+		a.acked = a.prev
+	}
+	a.prev = n
 	a.mu.Unlock()
 	a.conn.qpackInsertCountIncrement(inc)
 }
