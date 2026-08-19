@@ -14,6 +14,7 @@ import (
 	"github.com/MerIijn/quic-go"
 	"github.com/MerIijn/quic-go/http3/qlog"
 	"github.com/MerIijn/quic-go/qlogwriter"
+	"github.com/MerIijn/quic-go/qpack"
 	"github.com/MerIijn/quic-go/quicvarint"
 )
 
@@ -48,6 +49,7 @@ type rawConn struct {
 	// connection error (RFC 9204 §4.2), so these references just pin them alive.
 	qpackEncStr *quic.SendStream
 	qpackDecStr *quic.SendStream
+	qpackDecMx  sync.Mutex // serializes decoder-stream writes from every request stream
 
 	// controlStr is our local control stream; browsers send PRIORITY_UPDATE frames
 	// on it per request. controlMx guards writes after the initial SETTINGS frame.
@@ -192,6 +194,35 @@ func (c *rawConn) openQPACKStreams() error {
 	c.qpackDecStr = dec
 	c.qpackEncStr = enc
 	return nil
+}
+
+// qpackSectionAck writes a Section Acknowledgment (RFC 9204 4.4.1) for a header
+// block that referenced the dynamic table. Chrome sends one for every such
+// block; without them the peer can never evict an entry, and a decoder stream
+// that is opened and then stays silent forever is itself a tell.
+func (c *rawConn) qpackSectionAck(id quic.StreamID) {
+	c.qpackDecMx.Lock()
+	defer c.qpackDecMx.Unlock()
+	if c.qpackDecStr == nil {
+		return
+	}
+	// 1xxxxxxx: stream id as a 7-bit prefixed integer.
+	_, _ = c.qpackDecStr.Write(qpack.AppendPrefixedInt(nil, 0x80, 7, uint64(id)))
+}
+
+// qpackInsertCountIncrement writes an Insert Count Increment (RFC 9204 4.4.3)
+// covering inserts that no Section Acknowledgment has already acknowledged.
+func (c *rawConn) qpackInsertCountIncrement(n uint64) {
+	if n == 0 {
+		return
+	}
+	c.qpackDecMx.Lock()
+	defer c.qpackDecMx.Unlock()
+	if c.qpackDecStr == nil {
+		return
+	}
+	// 00xxxxxx: increment as a 6-bit prefixed integer.
+	_, _ = c.qpackDecStr.Write(qpack.AppendPrefixedInt(nil, 0x00, 6, n))
 }
 
 func (c *rawConn) TrackStream(str *quic.Stream) *stateTrackingStream {

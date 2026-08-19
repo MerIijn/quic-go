@@ -27,6 +27,16 @@ func appendVarInt(dst []byte, n byte, i uint64) []byte {
 	return append(dst, byte(i))
 }
 
+// AppendPrefixedInt appends v as an n-bit prefixed integer (RFC 7541 5.1) with
+// the instruction's pattern bits set in the first byte. QPACK's encoder- and
+// decoder-stream instructions are all of this shape.
+func AppendPrefixedInt(dst []byte, pattern byte, n byte, v uint64) []byte {
+	off := len(dst)
+	dst = appendVarInt(dst, n, v)
+	dst[off] |= pattern
+	return dst
+}
+
 // readVarInt reads an unsigned variable length integer off the
 // beginning of p. n is the parameter as described in
 // http://http2.github.io/http2-spec/compression.html#rfc.section.5.1.

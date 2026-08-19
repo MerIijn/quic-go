@@ -55,6 +55,9 @@ type ClientConn struct {
 	rawConn *rawConn
 
 	decoder *qpack.Decoder
+	// qpackAcks acknowledges the peer's dynamic-table activity on our decoder
+	// stream. nil when the peer advertises no table capacity.
+	qpackAcks *qpackAcks
 
 	// Additional HTTP/3 settings.
 	// It is invalid to specify any settings defined by RFC 9114 (HTTP/3) and RFC 9297 (HTTP Datagrams).
@@ -144,8 +147,14 @@ func newClientConn(
 	if capBytes := qpackMaxTableCapacity(settings); capBytes > 0 {
 		dt := qpack.NewDynamicTable(capBytes)
 		c.decoder.SetDynamicTable(dt)
+		acks := &qpackAcks{conn: c.rawConn, dt: dt}
+		c.qpackAcks = acks
 		c.rawConn.qpackEncoderStrHandler = func(str *quic.ReceiveStream) {
-			_ = dt.ParseEncoderInstructions(str)
+			// flushBeforeRead sends the Insert Count Increment for everything
+			// inserted so far each time the parser is about to block for more
+			// data, which batches the increments the way QUICHE does instead of
+			// emitting one per insert.
+			_ = dt.ParseEncoderInstructions(&flushBeforeRead{r: str, flush: acks.flushInserts})
 		}
 	}
 	// send the SETTINGs frame, using 0-RTT data, if possible
@@ -318,6 +327,7 @@ func (c *ClientConn) openRequestStream(
 		disableCompression,
 		maxHeaderBytes,
 		rsp,
+		c.qpackAckFn(),
 	), nil
 }
 
@@ -626,4 +636,55 @@ func (c *ClientConn) HandleBidirectionalStream(str *quic.Stream) {
 		quic.ApplicationErrorCode(ErrCodeStreamCreationError),
 		fmt.Sprintf("server opened bidirectional stream %d", str.StreamID()),
 	)
+}
+
+// qpackAcks is the decoder half of QPACK's flow control (RFC 9204 4.4): Section
+// Acknowledgments for header blocks that referenced the dynamic table, and
+// Insert Count Increments for inserts no section acknowledged. Chrome sends
+// both; a decoder stream that never carries anything both stalls the peer's
+// eviction and stands out on the wire.
+type qpackAcks struct {
+	conn *rawConn
+	dt   *qpack.DynamicTable
+
+	mu    sync.Mutex
+	acked uint64 // insert count the peer has been told we have
+}
+
+func (a *qpackAcks) section(id quic.StreamID, ric uint64) {
+	a.mu.Lock()
+	if ric > a.acked {
+		a.acked = ric // a Section Acknowledgment implicitly acknowledges its RIC
+	}
+	a.mu.Unlock()
+	a.conn.qpackSectionAck(id)
+}
+
+func (a *qpackAcks) flushInserts() {
+	a.mu.Lock()
+	n := a.dt.InsertCount()
+	inc := n - a.acked
+	a.acked = n
+	a.mu.Unlock()
+	a.conn.qpackInsertCountIncrement(inc)
+}
+
+func (c *ClientConn) qpackAckFn() func(quic.StreamID, uint64) {
+	if c.qpackAcks == nil {
+		return nil
+	}
+	return c.qpackAcks.section
+}
+
+// flushBeforeRead calls flush before every read that could block, so pending
+// acknowledgments go out once the currently available instructions have been
+// processed rather than one at a time.
+type flushBeforeRead struct {
+	r     io.Reader
+	flush func()
+}
+
+func (f *flushBeforeRead) Read(p []byte) (int, error) {
+	f.flush()
+	return f.r.Read(p)
 }

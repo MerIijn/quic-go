@@ -46,6 +46,18 @@ func (d *Decoder) SetDynamicTable(dt *DynamicTable) { d.dt = dt }
 
 // Decode returns a function that decodes header fields from the given header block.
 // It does not copy the slice; the caller must ensure it remains valid during decoding.
+// PeekRequiredInsertCount returns an encoded field section's Required Insert
+// Count without decoding it. A non-zero count means the section referenced the
+// dynamic table, which is what obliges the decoder to acknowledge the section
+// on its stream (RFC 9204 4.4.1).
+func (d *Decoder) PeekRequiredInsertCount(p []byte) (uint64, error) {
+	enc, _, err := readVarInt(8, p)
+	if err != nil {
+		return 0, err
+	}
+	return d.reconstructRIC(enc)
+}
+
 func (d *Decoder) Decode(p []byte) DecodeFunc {
 	var started bool
 	var base uint64

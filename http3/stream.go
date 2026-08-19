@@ -171,6 +171,9 @@ type RequestStream struct {
 	reqDone            chan<- struct{}
 	disableCompression bool
 	response           *http.Response
+	// qpackAck acknowledges a decoded header block that referenced the peer's
+	// QPACK dynamic table. nil when the connection has no dynamic table.
+	qpackAck func(quic.StreamID, uint64)
 
 	sentRequest   bool
 	requestedGzip bool
@@ -185,6 +188,7 @@ func newRequestStream(
 	disableCompression bool,
 	maxHeaderBytes int,
 	rsp *http.Response,
+	qpackAck func(quic.StreamID, uint64),
 ) *RequestStream {
 	return &RequestStream{
 		str:                str,
@@ -194,6 +198,7 @@ func newRequestStream(
 		disableCompression: disableCompression,
 		maxHeaderBytes:     maxHeaderBytes,
 		response:           rsp,
+		qpackAck:           qpackAck,
 	}
 }
 
@@ -345,6 +350,9 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		return nil, fmt.Errorf("http3: failed to read response headers: %w", err)
 	}
+	// Required Insert Count first: a block that referenced the dynamic table has
+	// to be acknowledged on the decoder stream once it decodes.
+	ric, _ := s.decoder.PeekRequiredInsertCount(headerBlock)
 	decodeFn := s.decoder.Decode(headerBlock)
 	var hfs []qpack.HeaderField
 	if s.str.qlogger != nil {
@@ -364,6 +372,10 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 		s.str.CancelRead(quic.StreamErrorCode(errCode))
 		s.str.CancelWrite(quic.StreamErrorCode(errCode))
 		return nil, fmt.Errorf("http3: invalid response: %w", err)
+	}
+
+	if ric > 0 && s.qpackAck != nil {
+		s.qpackAck(s.str.StreamID(), ric)
 	}
 
 	// Check that the server doesn't send more data in DATA frames than indicated by the Content-Length header (if set).

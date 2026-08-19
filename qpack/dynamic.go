@@ -90,6 +90,14 @@ func (dt *DynamicTable) insert(hf HeaderField) error {
 	return nil
 }
 
+// InsertCount returns the total number of entries ever inserted, which is what
+// the decoder acknowledges back to the peer (RFC 9204 4.4.3).
+func (dt *DynamicTable) InsertCount() uint64 {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	return dt.insertCount
+}
+
 // atAbsolute returns the entry with the given absolute index.
 func (dt *DynamicTable) atAbsolute(abs uint64) (HeaderField, bool) {
 	if abs < dt.dropped || abs >= dt.insertCount {
