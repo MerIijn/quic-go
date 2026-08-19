@@ -49,7 +49,10 @@ type rawConn struct {
 	// connection error (RFC 9204 §4.2), so these references just pin them alive.
 	qpackEncStr *quic.SendStream
 	qpackDecStr *quic.SendStream
-	qpackDecMx  sync.Mutex // serializes decoder-stream writes from every request stream
+	qpackDecMx  sync.Mutex // serializes decoder- and encoder-stream writes
+	// The stream type varints are written on first use, not at open time.
+	qpackDecTypeSent bool
+	qpackEncTypeSent bool
 
 	// controlStr is our local control stream; browsers send PRIORITY_UPDATE frames
 	// on it per request. controlMx guards writes after the initial SETTINGS frame.
@@ -106,6 +109,12 @@ func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, 
 	b := make([]byte, 0, 64)
 	b = quicvarint.Append(b, streamTypeControlStream)
 	b = settings.Append(b)
+	// A browser follows SETTINGS with a reserved (GREASE) frame on the control
+	// stream, in the same write. Only do it in the fingerprint path (ordered
+	// settings); default quic-go behaviour is unchanged.
+	if settings.Ordered != nil {
+		b = appendGREASEFrame(b)
+	}
 	if c.qlogger != nil {
 		sf := qlog.SettingsFrame{
 			MaxFieldSectionSize: settings.MaxFieldSectionSize,
@@ -166,29 +175,24 @@ func (c *rawConn) sendPriorityUpdate(streamID quic.StreamID, priority string) {
 	c.controlStr.Write(b)
 }
 
-// openQPACKStreams opens the client's QPACK decoder (type 0x03) and encoder
-// (type 0x02) unidirectional streams, writing only each stream-type varint. A
-// browser opens both immediately after the control stream even with an empty
-// dynamic table; matching that stream topology avoids an HTTP/3 fingerprint tell.
+// openQPACKStreams reserves the client's QPACK decoder and encoder
+// unidirectional streams. It deliberately writes NOTHING on them, not even the
+// stream-type varint: QUICHE reserves both stream ids at session start but only
+// writes the type byte when it has an instruction to send, and a capture of
+// Chrome 150 that never needed one shows no such streams on the wire at all
+// (while one that did shows both). Writing the types eagerly would put two
+// extra streams in our first flight that a browser's does not have.
 //
-// Order matters: verified against a Chrome 150 NetLog, Chrome creates the control
-// stream first (uni id 2), then the QPACK *decoder* (id 6), then the *encoder*
-// (id 10). Uni-stream ids are assigned in open order, so open decoder before
-// encoder to land the same type-on-id mapping. The streams are never closed (see
-// the qpackEncStr/qpackDecStr comment).
+// Order matters: the ids are assigned in open order, and Chrome's are control
+// (2), QPACK decoder (6), QPACK encoder (10) -- so open decoder before encoder.
+// The streams are never closed (see the qpackEncStr/qpackDecStr comment).
 func (c *rawConn) openQPACKStreams() error {
 	dec, err := c.conn.OpenUniStream()
 	if err != nil {
 		return err
 	}
-	if _, err := dec.Write(quicvarint.Append(nil, streamTypeQPACKDecoderStream)); err != nil {
-		return err
-	}
 	enc, err := c.conn.OpenUniStream()
 	if err != nil {
-		return err
-	}
-	if _, err := enc.Write(quicvarint.Append(nil, streamTypeQPACKEncoderStream)); err != nil {
 		return err
 	}
 	c.qpackDecStr = dec
@@ -196,18 +200,40 @@ func (c *rawConn) openQPACKStreams() error {
 	return nil
 }
 
-// qpackSectionAck writes a Section Acknowledgment (RFC 9204 4.4.1) for a header
-// block that referenced the dynamic table. Chrome sends one for every such
-// block; without them the peer can never evict an entry, and a decoder stream
-// that is opened and then stays silent forever is itself a tell.
-func (c *rawConn) qpackSectionAck(id quic.StreamID) {
-	c.qpackDecMx.Lock()
-	defer c.qpackDecMx.Unlock()
+// writeQPACKDecoder writes an instruction on the decoder stream, prefixing the
+// stream type on the first write (see openQPACKStreams). The caller holds
+// qpackDecMx.
+func (c *rawConn) writeQPACKDecoder(b []byte) {
 	if c.qpackDecStr == nil {
 		return
 	}
+	if !c.qpackDecTypeSent {
+		b = append(quicvarint.Append(nil, streamTypeQPACKDecoderStream), b...)
+		c.qpackDecTypeSent = true
+	}
+	_, _ = c.qpackDecStr.Write(b)
+}
+
+// QPACKEncoderStream returns the encoder stream with its type varint already
+// written, opening that write lazily the same way the decoder stream does.
+func (c *rawConn) QPACKEncoderStream() *quic.SendStream {
+	c.qpackDecMx.Lock()
+	defer c.qpackDecMx.Unlock()
+	if c.qpackEncStr == nil {
+		return nil
+	}
+	if !c.qpackEncTypeSent {
+		c.qpackEncTypeSent = true
+		_, _ = c.qpackEncStr.Write(quicvarint.Append(nil, streamTypeQPACKEncoderStream))
+	}
+	return c.qpackEncStr
+}
+
+func (c *rawConn) qpackSectionAck(id quic.StreamID) {
+	c.qpackDecMx.Lock()
+	defer c.qpackDecMx.Unlock()
 	// 1xxxxxxx: stream id as a 7-bit prefixed integer.
-	_, _ = c.qpackDecStr.Write(qpack.AppendPrefixedInt(nil, 0x80, 7, uint64(id)))
+	c.writeQPACKDecoder(qpack.AppendPrefixedInt(nil, 0x80, 7, uint64(id)))
 }
 
 // qpackInsertCountIncrement writes an Insert Count Increment (RFC 9204 4.4.3)
@@ -218,11 +244,8 @@ func (c *rawConn) qpackInsertCountIncrement(n uint64) {
 	}
 	c.qpackDecMx.Lock()
 	defer c.qpackDecMx.Unlock()
-	if c.qpackDecStr == nil {
-		return
-	}
 	// 00xxxxxx: increment as a 6-bit prefixed integer.
-	_, _ = c.qpackDecStr.Write(qpack.AppendPrefixedInt(nil, 0x00, 6, n))
+	c.writeQPACKDecoder(qpack.AppendPrefixedInt(nil, 0x00, 6, n))
 }
 
 func (c *rawConn) TrackStream(str *quic.Stream) *stateTrackingStream {

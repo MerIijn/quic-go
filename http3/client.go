@@ -19,6 +19,7 @@ import (
 	"github.com/MerIijn/quic-go/http3/qlog"
 	"github.com/MerIijn/quic-go/qlogwriter"
 	"github.com/MerIijn/quic-go/qpack"
+	"github.com/MerIijn/quic-go/quicvarint"
 )
 
 const (
@@ -207,7 +208,7 @@ func newClientConn(
 				if ours := qpackMaxTableCapacity(c.settings); ours > 0 && ours < peerCap {
 					peerCap = ours
 				}
-				c.requestWriter.enableDynamicQPACK(c.rawConn.qpackEncStr, peerCap)
+				c.requestWriter.enableDynamicQPACK(c.rawConn.QPACKEncoderStream(), peerCap)
 			}
 		}
 	}()
@@ -231,13 +232,36 @@ func requestPriority(req *http.Request) string {
 func greaseSetting() SettingVal {
 	var b [8]byte
 	crand.Read(b[:])
-	n := binary.BigEndian.Uint64(b[:]) % (1 << 26) // keep the varint a sane length
+	// Chrome draws N from a 32-bit range: its ids land around 2^34-2^37, which
+	// is an 8-byte varint. A smaller range would make our SETTINGS frame
+	// systematically shorter than a browser's (measured on a decrypted capture:
+	// Chrome 27-31 payload bytes).
+	n := binary.BigEndian.Uint64(b[:]) % (1 << 32)
 	if n == 0 {
 		n = 1
 	}
 	var v [4]byte
 	crand.Read(v[:])
 	return SettingVal{ID: 0x1f*n + 0x21, Val: uint64(binary.BigEndian.Uint32(v[:]))}
+}
+
+// appendGREASEFrame appends a reserved HTTP/3 frame: a random reserved type of
+// the form 0x1f*N+0x21 and a short random payload. Chrome writes one on the
+// control stream directly after SETTINGS, in the same write -- verified on a
+// decrypted Chrome 150 capture, where the payloads were 1 to 3 bytes. A peer
+// must ignore any frame type it does not know, which is the point of sending it.
+func appendGREASEFrame(b []byte) []byte {
+	var r [9]byte
+	crand.Read(r[:])
+	n := binary.BigEndian.Uint64(r[:8]) % (1 << 32)
+	if n == 0 {
+		n = 1
+	}
+	payload := make([]byte, int(r[8])%4)
+	crand.Read(payload)
+	b = quicvarint.Append(b, 0x1f*n+0x21)
+	b = quicvarint.Append(b, uint64(len(payload)))
+	return append(b, payload...)
 }
 
 // peerQPACKCapacity returns the peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x1),
