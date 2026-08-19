@@ -115,6 +115,24 @@ func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, 
 		if settings.ExtendedConnect {
 			sf.ExtendedConnect = pointer(true)
 		}
+		// An ordered SETTINGS frame is written verbatim and bypasses the fields
+		// above, so log what actually goes on the wire rather than the unused
+		// struct defaults — otherwise the trace shows an empty frame.
+		if settings.Ordered != nil {
+			sf = qlog.SettingsFrame{MaxFieldSectionSize: -1, Other: map[uint64]uint64{}}
+			for _, s := range settings.Ordered {
+				switch s.ID {
+				case settingMaxFieldSectionSize:
+					sf.MaxFieldSectionSize = int64(s.Val)
+				case settingDatagram:
+					sf.Datagram = pointer(s.Val == 1)
+				case settingExtendedConnect:
+					sf.ExtendedConnect = pointer(s.Val == 1)
+				default:
+					sf.Other[s.ID] = s.Val
+				}
+			}
+		}
 		c.qlogger.RecordEvent(qlog.FrameCreated{
 			StreamID: str.StreamID(),
 			Raw:      qlog.RawInfo{Length: len(b)},
