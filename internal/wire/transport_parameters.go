@@ -534,10 +534,16 @@ func (p *TransportParameters) marshalChrome() []byte {
 	add(p.marshalVarintParam(nil, initialMaxStreamDataBidiLocalParameterID, uint64(p.InitialMaxStreamDataBidiLocal)))
 	add(p.marshalVarintParam(nil, initialMaxStreamsUniParameterID, uint64(p.MaxUniStreamNum)))
 
-	// NOTE: google_initial_rtt (0x3127) is deliberately NOT sent. Chrome only
-	// includes it when it already has a cached RTT estimate for the origin; on a
-	// fresh connection — which is always our case — it is absent. Emitting it
-	// unconditionally added 5 bytes Chrome doesn't send.
+	// google_initial_rtt (0x3127): Chrome sends its cached smoothed RTT for the
+	// origin, in microseconds. It is present whenever Chrome has talked to the
+	// host before — which is the normal case here, since h3 is warmed only after
+	// an HTTP/2 response advertised Alt-Svc. The value is a measurement, so it
+	// differs every time; emit a plausible one rather than a constant, which
+	// would itself be a fingerprint.
+	var rttb [2]byte
+	rand.Read(rttb[:])
+	initialRTT := 8000 + uint64(binary.BigEndian.Uint16(rttb[:]))%37000 // 8-45ms
+	add(p.marshalVarintParam(nil, transportParameterID(0x3127), initialRTT))
 
 	// google_connection_options (0x3128): Chrome 151 sends "ORIG" (4 bytes), not
 	// the older 8-byte "ORIGNOIP".
