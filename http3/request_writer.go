@@ -20,6 +20,7 @@ import (
 	"github.com/MerIijn/quic-go/http3/qlog"
 	"github.com/MerIijn/quic-go/qlogwriter"
 	"github.com/MerIijn/quic-go/qpack"
+	"github.com/MerIijn/quic-go/quicvarint"
 )
 
 const bodyCopyBufferSize = 8 * 1024
@@ -60,13 +61,89 @@ func newRequestWriter() *requestWriter {
 // enableDynamicQPACK switches the shared encoder to dynamic-table mode, writing
 // insertions to the QPACK encoder stream. Guarded by the same mutex writeHeaders
 // takes, so it can't race with an in-flight request.
-func (w *requestWriter) enableDynamicQPACK(encStream io.Writer, capacity uint64) {
+func (w *requestWriter) enableDynamicQPACK(encStream io.Writer, capacity, blocked uint64) {
 	if encStream == nil || capacity == 0 {
 		return
 	}
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 	w.encoder.EnableDynamicTable(encStream, capacity)
+	w.encoder.SetBlockedStreams(blocked)
+}
+
+// noteDecoderInstruction feeds one instruction from the peer's QPACK decoder
+// stream back to the encoder, which needs it to know how much of its table the
+// peer has processed.
+func (w *requestWriter) noteDecoderInstruction(kind byte, val uint64) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	switch kind {
+	case qpackSectionAck:
+		w.encoder.NoteSectionAck(val)
+	case qpackInsertCountIncrement:
+		w.encoder.NoteInsertCountIncrement(val)
+	case qpackStreamCancel:
+		w.encoder.NoteStreamCancel(val)
+	}
+}
+
+// QPACK decoder-stream instruction kinds (RFC 9204 4.4).
+const (
+	qpackSectionAck byte = iota
+	qpackStreamCancel
+	qpackInsertCountIncrement
+)
+
+// readQPACKDecoderStream parses the peer's decoder stream until it ends,
+// reporting each instruction.
+func readQPACKDecoderStream(r io.Reader, note func(kind byte, val uint64)) {
+	br := quicvarint.NewReader(r)
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return
+		}
+		var kind byte
+		var prefix int
+		switch {
+		case b&0x80 != 0:
+			kind, prefix = qpackSectionAck, 7
+		case b&0x40 != 0:
+			kind, prefix = qpackStreamCancel, 6
+		default:
+			kind, prefix = qpackInsertCountIncrement, 6
+		}
+		val, err := readPrefixedInt(br, b, prefix)
+		if err != nil {
+			return
+		}
+		note(kind, val)
+	}
+}
+
+// readPrefixedInt completes an RFC 7541 prefixed integer whose first byte has
+// already been read.
+func readPrefixedInt(br io.ByteReader, first byte, n int) (uint64, error) {
+	max := uint64(1)<<uint(n) - 1
+	v := uint64(first) & max
+	if v < max {
+		return v, nil
+	}
+	var m uint
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		v += uint64(b&0x7f) << m
+		if b&0x80 == 0 {
+			return v, nil
+		}
+		m += 7
+		if m > 62 {
+			return 0, errors.New("qpack: prefixed integer overflow")
+		}
+	}
 }
 
 func (w *requestWriter) WriteRequestHeader(wr io.Writer, req *http.Request, gzip bool, streamID quic.StreamID, qlogger qlogwriter.Recorder) error {
@@ -87,6 +164,9 @@ func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool,
 	defer w.mutex.Unlock()
 	defer w.encoder.Close()
 	defer w.headerBuf.Reset()
+	// Name the stream this block belongs to, so a Section Acknowledgment for it
+	// can be matched to the insert count the block required.
+	w.encoder.SetStreamID(uint64(streamID))
 
 	var trailers string
 	if len(req.Trailer) > 0 {

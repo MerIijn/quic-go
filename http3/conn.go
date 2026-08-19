@@ -41,6 +41,7 @@ type rawConn struct {
 	rcvdQPACKDecoderStr    atomic.Bool
 	controlStrHandler      func(*quic.ReceiveStream, *frameParser) // is called *after* the SETTINGS frame was parsed
 	qpackEncoderStrHandler func(*quic.ReceiveStream)               // reads the peer's QPACK encoder stream (dynamic table)
+	qpackDecoderStrHandler func(*quic.ReceiveStream)               // reads the peer's QPACK decoder stream (acknowledgements)
 
 	// QPACK encoder/decoder unidirectional streams. Real browsers open both right
 	// after the control stream even when they never use the QPACK dynamic table.
@@ -319,7 +320,11 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 		if isFirst := c.rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK decoder stream")
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		// Read the peer's acknowledgements when we encode with the dynamic
+		// table; otherwise drain and ignore.
+		if c.qpackDecoderStrHandler != nil {
+			c.qpackDecoderStrHandler(str)
+		}
 		return
 	case streamTypePushStream:
 		if isServer {

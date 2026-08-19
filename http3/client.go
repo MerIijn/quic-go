@@ -208,7 +208,17 @@ func newClientConn(
 				if ours := qpackMaxTableCapacity(c.settings); ours > 0 && ours < peerCap {
 					peerCap = ours
 				}
-				c.requestWriter.enableDynamicQPACK(c.rawConn.QPACKEncoderStream(), peerCap)
+				// The peer's blocked-stream budget decides whether a request may
+				// reference an entry it has not processed yet. Peers differ: Google
+				// allows 100, and one that allows none simply never answers a
+				// blocking request.
+				c.requestWriter.enableDynamicQPACK(c.rawConn.QPACKEncoderStream(), peerCap,
+					peerSetting(c.rawConn.Settings(), 0x7))
+				// The peer's decoder stream tells us how much of our table it has
+				// processed, which is what makes references safe without blocking.
+				c.rawConn.qpackDecoderStrHandler = func(str *quic.ReceiveStream) {
+					readQPACKDecoderStream(str, c.requestWriter.noteDecoderInstruction)
+				}
 			}
 		}
 	}()
@@ -262,6 +272,14 @@ func appendGREASEFrame(b []byte) []byte {
 	b = quicvarint.Append(b, 0x1f*n+0x21)
 	b = quicvarint.Append(b, uint64(len(payload)))
 	return append(b, payload...)
+}
+
+// peerSetting returns one of the peer's HTTP/3 settings, or 0 if unset.
+func peerSetting(s *Settings, id uint64) uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.Other[id]
 }
 
 // peerQPACKCapacity returns the peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x1),

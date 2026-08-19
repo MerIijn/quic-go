@@ -27,6 +27,20 @@ type encoderDynamic struct {
 	insertCnt uint64        // absolute index of the next insertion
 	entries   []HeaderField // entries[i] has absolute index dropped+i
 	dropped   uint64
+
+	// A header block that references an entry the peer has not processed yet
+	// leaves the stream BLOCKED until its decoder catches up, and RFC 9204 2.1.2
+	// forbids blocking more streams than the peer's
+	// SETTINGS_QPACK_BLOCKED_STREAMS allows. Peers differ sharply here: Google
+	// advertises 100, Cloudflare offers no dynamic table at all, and a peer that
+	// advertises 0 will simply never answer a blocking request -- which is
+	// exactly how this failed before the gate existed. When blocking is not
+	// allowed we still insert, but only reference entries the peer has
+	// acknowledged.
+	blocked       uint64            // peer's SETTINGS_QPACK_BLOCKED_STREAMS
+	knownReceived uint64            // inserts the peer has acknowledged
+	sentRIC       map[uint64]uint64 // stream id -> Required Insert Count of its last block
+	streamID      uint64            // stream the next block belongs to
 }
 
 // EnableDynamicTable turns on dynamic-table encoding, writing insert
@@ -36,7 +50,67 @@ func (e *Encoder) EnableDynamicTable(encStream io.Writer, capacity uint64) {
 	if e.dyn != nil || encStream == nil || capacity == 0 {
 		return
 	}
-	e.dyn = &encoderDynamic{stream: encStream, capacity: capacity}
+	e.dyn = &encoderDynamic{stream: encStream, capacity: capacity, sentRIC: map[uint64]uint64{}}
+}
+
+// SetBlockedStreams records the peer's SETTINGS_QPACK_BLOCKED_STREAMS. Until it
+// is called the encoder assumes zero, so it never blocks a stream it has not
+// been told it may block.
+func (e *Encoder) SetBlockedStreams(n uint64) {
+	if e.dyn == nil {
+		return
+	}
+	e.dyn.mu.Lock()
+	defer e.dyn.mu.Unlock()
+	e.dyn.blocked = n
+}
+
+// SetStreamID names the request stream the next header block belongs to, so a
+// Section Acknowledgment for it can be matched to the count that block required.
+func (e *Encoder) SetStreamID(id uint64) {
+	if e.dyn == nil {
+		return
+	}
+	e.dyn.mu.Lock()
+	defer e.dyn.mu.Unlock()
+	e.dyn.streamID = id
+}
+
+// NoteSectionAck records the peer acknowledging a header block: it has processed
+// at least as many inserts as that block required.
+func (e *Encoder) NoteSectionAck(streamID uint64) {
+	if e.dyn == nil {
+		return
+	}
+	d := e.dyn
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if ric, ok := d.sentRIC[streamID]; ok {
+		if ric > d.knownReceived {
+			d.knownReceived = ric
+		}
+		delete(d.sentRIC, streamID)
+	}
+}
+
+// NoteInsertCountIncrement records the peer processing n further inserts.
+func (e *Encoder) NoteInsertCountIncrement(n uint64) {
+	if e.dyn == nil {
+		return
+	}
+	e.dyn.mu.Lock()
+	defer e.dyn.mu.Unlock()
+	e.dyn.knownReceived += n
+}
+
+// NoteStreamCancel drops the bookkeeping for a cancelled stream.
+func (e *Encoder) NoteStreamCancel(streamID uint64) {
+	if e.dyn == nil {
+		return
+	}
+	e.dyn.mu.Lock()
+	defer e.dyn.mu.Unlock()
+	delete(e.dyn.sentRIC, streamID)
 }
 
 // find returns the absolute index of an exact name+value match, if present.
@@ -116,26 +190,41 @@ func (e *Encoder) flushDynamic() error {
 		dynamic bool
 		hf      HeaderField
 	}
+	// mayReference reports whether referencing an entry is allowed right now.
+	// With no blocking budget, only entries the peer has already acknowledged
+	// can be referenced; the rest are inserted for later requests and sent
+	// literally in this one.
+	mayReference := func(abs uint64) bool {
+		return d.blocked > 0 || abs < d.knownReceived
+	}
+
 	refs := make([]ref, 0, len(e.pending))
 	var maxAbs uint64
 	var used bool
 	for _, hf := range e.pending {
-		if abs, ok := d.find(hf); ok {
+		if abs, ok := d.find(hf); ok && mayReference(abs) {
 			refs = append(refs, ref{abs: abs, dynamic: true, hf: hf})
 			if abs+1 > maxAbs {
 				maxAbs = abs + 1
 			}
 			used = true
 			continue
+		} else if ok {
+			refs = append(refs, ref{hf: hf}) // known, but not yet acknowledged
+			continue
 		}
 		if shouldInsert(hf) {
 			if abs, ok := d.insert(hf); ok {
-				refs = append(refs, ref{abs: abs, dynamic: true, hf: hf})
-				if abs+1 > maxAbs {
-					maxAbs = abs + 1
+				if mayReference(abs) {
+					refs = append(refs, ref{abs: abs, dynamic: true, hf: hf})
+					if abs+1 > maxAbs {
+						maxAbs = abs + 1
+					}
+					used = true
+					continue
 				}
-				used = true
-				continue
+				// Inserted for a later request; this block stays literal so it
+				// does not block on an entry the peer has not processed.
 			}
 		}
 		refs = append(refs, ref{hf: hf})
@@ -155,6 +244,9 @@ func (e *Encoder) flushDynamic() error {
 		}
 		out = appendVarInt(out, 8, enc)
 		out = appendVarInt(out, 7, 0) // DeltaBase 0, S=0 → Base == RIC
+		// Remember what this block required, so the peer's Section
+		// Acknowledgment for this stream tells us it has processed that much.
+		d.sentRIC[d.streamID] = maxAbs
 	}
 
 	for _, r := range refs {
