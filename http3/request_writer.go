@@ -23,7 +23,11 @@ import (
 	"github.com/MerIijn/quic-go/quicvarint"
 )
 
-const bodyCopyBufferSize = 8 * 1024
+// bodyCopyBufferSize is how much of a request body is handed to the stream at
+// a time. It shows up on the wire: each copy becomes a burst of QUIC packets
+// between inbound ACKs, and at 8 KiB our uploads went out in bursts with a
+// median of 5 full-size packets where Chrome's median was 10.
+const bodyCopyBufferSize = 32 * 1024
 
 type requestWriter struct {
 	mutex     sync.Mutex
