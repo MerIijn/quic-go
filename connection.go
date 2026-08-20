@@ -3,9 +3,9 @@ package quic
 import (
 	"bytes"
 	"context"
-	tls "github.com/refraction-networking/utls"
 	"errors"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
 	"io"
 	"net"
 	"reflect"
@@ -570,7 +570,7 @@ func (c *Conn) preSetup() {
 	c.lastPacketReceivedTime = now
 	c.creationTime = now
 
-	c.receivedPacketHandler = *ackhandler.NewReceivedPacketHandler(c.logger)
+	c.receivedPacketHandler = *ackhandler.NewReceivedPacketHandler(c.rttStats, c.logger)
 
 	c.datagramQueue = newDatagramQueue(c.scheduleSending, c.logger)
 	c.connState.Version = c.version

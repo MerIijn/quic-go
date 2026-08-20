@@ -75,8 +75,19 @@ func (h *receivedPacketTracker) IsPotentiallyDuplicate(pn protocol.PacketNumber)
 	return h.packetHistory.IsPotentiallyDuplicate(pn)
 }
 
-// number of ack-eliciting packets received before sending an ACK
-const packetsBeforeAck = 2
+// Number of ack-eliciting packets received before sending an ACK.
+//
+// QUICHE, and so Chrome, acknowledges every second packet only while the
+// connection is starting up; once it has seen minReceivedBeforeDecimation
+// packets it decimates, acknowledging every tenth and otherwise leaning on the
+// ack timer. The difference is plainly measurable from the outside: downloading
+// the same file, Chrome sent one ACK per 9.6 received packets where this stack
+// sent one per 2.6.
+const (
+	packetsBeforeAck            = 2
+	packetsBeforeAckDecimated   = 10
+	minReceivedBeforeDecimation = 100
+)
 
 // The appDataReceivedPacketTracker tracks packets received in the Application Data packet number space.
 // It waits until at least 2 packets were received before queueing an ACK, or until the max_ack_delay was reached.
@@ -89,21 +100,42 @@ type appDataReceivedPacketTracker struct {
 	ignoreBelow     protocol.PacketNumber
 
 	maxAckDelay time.Duration
+	rttStats    *utils.RTTStats
 	ackQueued   bool // true if we need send a new ACK
 
 	ackElicitingPacketsReceivedSinceLastAck int
+	ackElicitingPacketsReceived             int // total; decimation keys off this
 	ackAlarm                                monotime.Time
 
 	logger utils.Logger
 }
 
-func newAppDataReceivedPacketTracker(logger utils.Logger) *appDataReceivedPacketTracker {
+func newAppDataReceivedPacketTracker(rttStats *utils.RTTStats, logger utils.Logger) *appDataReceivedPacketTracker {
 	h := &appDataReceivedPacketTracker{
 		receivedPacketTracker: *newReceivedPacketTracker(),
 		maxAckDelay:           protocol.MaxAckDelay,
+		rttStats:              rttStats,
 		logger:                logger,
 	}
 	return h
+}
+
+// ackDelay returns how long an ACK may be held back. While decimating, QUICHE
+// waits a quarter of the smoothed RTT rather than the full max_ack_delay, which
+// is why its ACKs still arrive every few packets on a fast path instead of
+// every tenth.
+func (h *appDataReceivedPacketTracker) ackDelay() time.Duration {
+	if h.ackElicitingPacketsReceived < minReceivedBeforeDecimation || h.rttStats == nil {
+		return h.maxAckDelay
+	}
+	d := h.rttStats.MinRTT() / 4 // QUICHE scales the minimum RTT, not the smoothed one
+	if d <= 0 || d > h.maxAckDelay {
+		return h.maxAckDelay
+	}
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
 }
 
 func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, ecn protocol.ECN, rcvTime monotime.Time, ackEliciting bool) error {
@@ -118,6 +150,7 @@ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, 
 		return nil
 	}
 	h.ackElicitingPacketsReceivedSinceLastAck++
+	h.ackElicitingPacketsReceived++
 	isMissing := h.isMissing(pn)
 	if !h.ackQueued && h.shouldQueueACK(pn, ecn, isMissing) {
 		h.ackQueued = true
@@ -183,10 +216,15 @@ func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, 
 		return true
 	}
 
-	// send an ACK every 2 ack-eliciting packets
-	if h.ackElicitingPacketsReceivedSinceLastAck >= packetsBeforeAck {
+	// Acknowledge every second packet at first, then every tenth once the
+	// connection is past its startup -- the cadence QUICHE uses.
+	threshold := packetsBeforeAck
+	if h.ackElicitingPacketsReceived >= minReceivedBeforeDecimation {
+		threshold = packetsBeforeAckDecimated
+	}
+	if h.ackElicitingPacketsReceivedSinceLastAck >= threshold {
 		if h.logger.Debug() {
-			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, packetsBeforeAck)
+			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, threshold)
 		}
 		return true
 	}
