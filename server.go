@@ -2,7 +2,7 @@ package quic
 
 import (
 	"context"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"errors"
 	"fmt"
 	"net"

@@ -3,7 +3,7 @@ package http3
 import (
 	cryptotls "crypto/tls"
 
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 )
 
 // toStdConnState converts a uTLS ConnectionState to a crypto/tls ConnectionState

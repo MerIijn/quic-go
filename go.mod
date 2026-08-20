@@ -3,6 +3,7 @@ module github.com/MerIijn/quic-go
 go 1.25.0
 
 require (
+	github.com/MerIijn/utls v1.8.2-vibetls
 	github.com/quic-go/go-ossfuzz-seeds v0.1.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/mock v0.5.2
@@ -19,7 +20,6 @@ require (
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/refraction-networking/utls v1.8.2 // indirect
 	github.com/rogpeppe/go-internal v1.10.0 // indirect
 	golang.org/x/mod v0.35.0 // indirect
 	golang.org/x/text v0.37.0 // indirect

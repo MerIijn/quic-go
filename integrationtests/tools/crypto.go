@@ -4,7 +4,7 @@ import (
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"

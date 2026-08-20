@@ -2,9 +2,9 @@ package handshake
 
 import (
 	"context"
-	tls "github.com/refraction-networking/utls"
 	"errors"
 	"fmt"
+	tls "github.com/MerIijn/utls"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -111,13 +111,6 @@ func NewCryptoSetupClient(
 		TLSConfig:           tlsConf,
 		EnableSessionEvents: true,
 	}
-	// The uTLS connections below turn the session events back off. UQUICConn
-	// has no StoreSession, so with the events on every ticket is dropped and
-	// every connection is a full handshake -- a cross-connection tell, because
-	// a browser resumes. With them off uTLS stores and loads sessions in the
-	// tls.Config's ClientSessionCache itself, which is what populates the
-	// pre_shared_key extension on the next ClientHello. The cost is 0-RTT:
-	// quic-go never sees the ticket, so it never offers early data.
 	switch {
 	case clientHelloSpec != nil:
 		// uTLS's QUICTransportParametersExtension marshals its own (empty) params
@@ -134,14 +127,12 @@ func NewCryptoSetupClient(
 			}
 		}
 		spec.Extensions = exts
-		qconf.EnableSessionEvents = false
 		uconn := tls.UQUICClient(qconf, tls.HelloCustom)
 		if err := uconn.ApplyPreset(&spec); err != nil {
 			panic("quic: ApplyPreset ClientHelloSpec: " + err.Error())
 		}
 		cs.conn = uconn
 	case clientHelloID != nil:
-		qconf.EnableSessionEvents = false
 		cs.conn = tls.UQUICClient(qconf, *clientHelloID)
 	default:
 		cs.conn = tls.QUICClient(qconf)
@@ -325,8 +316,9 @@ func (h *cryptoSetup) handleEvent(ev tls.QUICEvent) (err error) {
 			ev.SessionState.Extra,
 			addSessionStateExtraPrefix(h.marshalDataForSessionState(ev.SessionState.EarlyData)),
 		)
-		// uTLS's UQUICConn does not implement StoreSession (no 0-RTT session
-		// caching); skip storage there. The default QUICConn does.
+		// Both QUICConn and the uTLS UQUICConn implement this; storing the
+		// session here is what carries our transport parameters into the ticket,
+		// which is what makes 0-RTT possible on the next connection.
 		if sc, ok := h.conn.(interface {
 			StoreSession(*tls.SessionState) error
 		}); ok {

@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"io"
 	"net"
 	"reflect"

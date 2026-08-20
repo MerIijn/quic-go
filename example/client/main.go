@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"crypto/x509"
 	"flag"
 	"io"

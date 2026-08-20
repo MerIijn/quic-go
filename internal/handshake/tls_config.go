@@ -1,7 +1,7 @@
 package handshake
 
 import (
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"net"
 )
 

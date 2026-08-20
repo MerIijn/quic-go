@@ -3,7 +3,7 @@ package quic
 import (
 	"context"
 	"crypto/rand"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"errors"
 	"fmt"
 	"net"

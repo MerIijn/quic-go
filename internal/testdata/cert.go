@@ -1,7 +1,7 @@
 package testdata
 
 import (
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"crypto/x509"
 	"os"
 	"path"

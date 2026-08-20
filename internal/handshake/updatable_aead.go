@@ -3,7 +3,7 @@ package handshake
 import (
 	"crypto"
 	"crypto/cipher"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"encoding/binary"
 	"fmt"
 	"sync/atomic"

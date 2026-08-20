@@ -438,6 +438,17 @@ func (c *ClientConn) onStreamsEmpty() {
 	}
 }
 
+// waitForHandshake blocks until the connection's handshake completes, so a
+// request that must not be replayed is never sent as early data.
+func waitForHandshake(c *ClientConn, req *http.Request) error {
+	select {
+	case <-c.conn.HandshakeComplete():
+		return nil
+	case <-req.Context().Done():
+		return req.Context().Err()
+	}
+}
+
 // RoundTrip executes a request and returns a response
 func (c *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
 	rsp, err := c.roundTrip(req)
@@ -461,12 +472,23 @@ func (c *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 		reqCopy := *req
 		req = &reqCopy
 		req.Method = http.MethodHead
+	case http.MethodGet, http.MethodHead:
+		// A browser sends plain GETs and HEADs as 0-RTT on a resumed connection
+		// -- measured on Chrome, which puts long-header 0-RTT packets on the wire
+		// for exactly these -- so a client that offers early_data and then waits
+		// for the handshake anyway advertises a capability it never uses.
+		//
+		// 0-RTT data can be replayed by an on-path attacker, which is why this is
+		// limited to the methods HTTP defines as safe, and only when there is no
+		// body to replay. Anything else still waits.
+		if req.Body != nil && req.Body != http.NoBody {
+			if err := waitForHandshake(c, req); err != nil {
+				return nil, err
+			}
+		}
 	default:
-		// wait for the handshake to complete
-		select {
-		case <-c.conn.HandshakeComplete():
-		case <-req.Context().Done():
-			return nil, req.Context().Err()
+		if err := waitForHandshake(c, req); err != nil {
+			return nil, err
 		}
 	}
 

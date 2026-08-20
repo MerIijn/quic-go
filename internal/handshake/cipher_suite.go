@@ -5,7 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/fips140"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"fmt"
 
 	"golang.org/x/crypto/chacha20poly1305"

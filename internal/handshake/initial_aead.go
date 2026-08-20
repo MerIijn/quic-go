@@ -3,7 +3,7 @@ package handshake
 import (
 	"crypto"
 	"crypto/hkdf"
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"fmt"
 
 	"github.com/MerIijn/quic-go/internal/protocol"

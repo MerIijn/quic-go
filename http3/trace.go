@@ -1,7 +1,7 @@
 package http3
 
 import (
-	tls "github.com/refraction-networking/utls"
+	tls "github.com/MerIijn/utls"
 	"net"
 	"net/http/httptrace"
 	"net/textproto"
