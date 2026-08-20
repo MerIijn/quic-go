@@ -193,12 +193,20 @@ func newClientConn(
 			}
 			return
 		}
-		// Request-side QPACK dynamic-table encoding (insert on the encoder stream
-		// and reference by index) is implemented but DISABLED: when enabled, the
-		// origin stops responding (stream stays open, connection idles out), so the
-		// instruction/prefix encoding is not yet correct. Set VIBETLS_QPACK_DYNAMIC=1
-		// to experiment. Static+literal encoding is always valid on the wire.
-		if c.settings != nil && os.Getenv("VIBETLS_QPACK_DYNAMIC") == "1" {
+		// Request-side QPACK dynamic-table encoding: insert header fields on the
+		// encoder stream and reference them by index from later requests. A
+		// browser does this -- advertising a 64 KB table and never touching it is
+		// an asymmetry none of them exhibits -- and it is what puts a QPACK
+		// encoder stream on the wire at all.
+		//
+		// This was disabled for a long time because a request could stall: it
+		// referenced entries in the same block that inserted them, which leaves
+		// the stream blocked until the peer's decoder catches up, and RFC 9204
+		// 2.1.2 caps that at the peer's SETTINGS_QPACK_BLOCKED_STREAMS. The
+		// encoder now tracks what the peer has acknowledged and respects that
+		// budget. Set VIBETLS_QPACK_DYNAMIC=0 to fall back to static+literal
+		// encoding, which is always valid on the wire.
+		if c.settings != nil && os.Getenv("VIBETLS_QPACK_DYNAMIC") != "0" {
 			select {
 			case <-c.rawConn.ReceivedSettings():
 			case <-c.conn.Context().Done():

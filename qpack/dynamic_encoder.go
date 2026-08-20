@@ -137,12 +137,26 @@ func (d *encoderDynamic) insert(hf HeaderField) (uint64, bool) {
 		b[0] |= 0x20
 		d.sentCap = true
 	}
-	// Insert With Literal Name: 01Hxxxxx (H = Huffman) with a 5-bit name length.
+	// Chrome reaches for the static table's NAME when it has one -- an "Insert
+	// With Name Reference" is shorter than repeating the name, and its encoder
+	// stream shows both forms side by side: name references for user-agent,
+	// accept, accept-encoding and friends, literal names for sec-ch-ua*,
+	// sec-fetch-*, priority and x-*. Inserting everything literally, as this
+	// used to, is a visible difference on the encoder stream.
+	if idx, ok := staticNameIndex(hf.Name); ok {
+		// Insert With Name Reference: 1Txxxxxx, T=1 for the static table,
+		// 6-bit prefix index.
+		off := len(b)
+		b = appendVarInt(b, 6, uint64(idx))
+		b[off] |= 0x80 | 0x40
+	} else {
+		// Insert With Literal Name: 01Hxxxxx (H = Huffman) with a 5-bit name length.
+		off := len(b)
+		b = appendVarInt(b, 5, hpack.HuffmanEncodeLength(hf.Name))
+		b[off] |= 0x40 | 0x20 // pattern 01, Huffman
+		b = hpack.AppendHuffmanString(b, hf.Name)
+	}
 	off := len(b)
-	b = appendVarInt(b, 5, hpack.HuffmanEncodeLength(hf.Name))
-	b[off] |= 0x40 | 0x20 // pattern 01, Huffman
-	b = hpack.AppendHuffmanString(b, hf.Name)
-	off = len(b)
 	b = appendVarInt(b, 7, hpack.HuffmanEncodeLength(hf.Value))
 	b[off] |= 0x80 // Huffman
 	b = hpack.AppendHuffmanString(b, hf.Value)
@@ -164,12 +178,30 @@ func (d *encoderDynamic) insert(hf HeaderField) (uint64, bool) {
 	return idx, true
 }
 
+// staticNameIndex returns a static-table index whose entry has this name.
+func staticNameIndex(name string) (uint8, bool) {
+	e, ok := encoderMap[name]
+	if !ok {
+		return 0, false
+	}
+	// idx is the index of the entry that carries this name; entries that also
+	// pin specific values are irrelevant here, since only the name is referenced.
+	return e.idx, true
+}
+
 // shouldInsert reports whether a field is worth putting in the dynamic table.
 // Browsers insert the stable, repeated request headers and leave one-offs
 // literal; never insert a cookie (it changes per request and would thrash).
 func shouldInsert(hf HeaderField) bool {
-	if len(hf.Name) == 0 || hf.Name[0] == ':' {
-		return false // pseudo-headers stay static/literal
+	if len(hf.Name) == 0 {
+		return false
+	}
+	if hf.Name[0] == ':' {
+		// :method and :scheme have exact static-table entries, so inserting them
+		// would be pointless. :authority and :path only have their names there,
+		// and Chrome does insert both -- its encoder stream references static
+		// indices 0 and 1 for exactly that.
+		return hf.Name == ":authority" || hf.Name == ":path"
 	}
 	switch hf.Name {
 	case "cookie", "content-length", "if-none-match", "if-modified-since", "referer":
