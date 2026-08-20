@@ -121,8 +121,8 @@ func newAppDataReceivedPacketTracker(rttStats *utils.RTTStats, logger utils.Logg
 }
 
 // ackDelay returns how long an ACK may be held back. While decimating, QUICHE
-// waits a quarter of the smoothed RTT rather than the full max_ack_delay, which
-// is why its ACKs still arrive every few packets on a fast path instead of
+// waits a quarter of the minimum RTT rather than the full max_ack_delay, which
+// is why its ACKs still arrive every few packets on a fast path instead of only
 // every tenth.
 func (h *appDataReceivedPacketTracker) ackDelay() time.Duration {
 	if h.ackElicitingPacketsReceived < minReceivedBeforeDecimation || h.rttStats == nil {
@@ -157,10 +157,14 @@ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, 
 		h.ackAlarm = 0 // cancel the ack alarm
 	}
 	if !h.ackQueued {
-		// No ACK queued, but we'll need to acknowledge the packet after max_ack_delay.
-		h.ackAlarm = rcvTime.Add(h.maxAckDelay)
-		if h.logger.Debug() {
-			h.logger.Debugf("\tSetting ACK timer to max ack delay: %s", h.maxAckDelay)
+		// Arm the ack timer, but never push an already-armed one further out:
+		// QUICHE keeps the earliest deadline, so a steady burst still gets an
+		// ACK when the timer expires. Resetting it on every arrival means the
+		// timer never fires while data keeps coming, and the packet threshold
+		// alone decides the cadence.
+		deadline := rcvTime.Add(h.ackDelay())
+		if h.ackAlarm == 0 || deadline < h.ackAlarm {
+			h.ackAlarm = deadline
 		}
 	}
 	return nil
