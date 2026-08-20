@@ -3,9 +3,9 @@ package handshake
 import (
 	"crypto"
 	"crypto/cipher"
-	tls "github.com/MerIijn/utls"
 	"encoding/binary"
 	"fmt"
+	tls "github.com/MerIijn/utls"
 	"sync/atomic"
 
 	"github.com/MerIijn/quic-go/internal/monotime"
@@ -29,7 +29,14 @@ func SetKeyUpdateInterval(v uint64) (reset func()) {
 
 // FirstKeyUpdateInterval is the maximum number of packets we send or receive before initiating the first key update.
 // It's a package-level variable to allow modifying it for testing purposes.
-var FirstKeyUpdateInterval uint64 = 100
+//
+// Upstream sets this to 100, which rotates keys almost immediately and flips
+// the key phase bit an origin can see: measured on one connection, ours flipped
+// within 82 packets while Chrome's stayed on phase 0 for 3531 packets sent and
+// 34387 received, on every one of its connections. Chrome does not rekey on a
+// packet-count schedule this short, so neither do we -- the first update now
+// waits for the same interval as every later one.
+var FirstKeyUpdateInterval uint64 = protocol.KeyUpdateInterval
 
 type updatableAEAD struct {
 	suite cipherSuite
